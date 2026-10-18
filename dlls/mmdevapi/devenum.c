@@ -89,11 +89,13 @@ static const IPropertyBagVtbl PB_Vtbl;
 typedef struct IConnectorImpl {
     IConnector IConnector_iface;
     LONG ref;
+    MMDevice *device;
 } IConnectorImpl;
 
 typedef struct IDeviceTopologyImpl {
     IDeviceTopology IDeviceTopology_iface;
     LONG ref;
+    MMDevice *device;
 } IDeviceTopologyImpl;
 
 static HRESULT MMDevPropStore_Create(MMDevice *This, DWORD access, IPropertyStore **ppv);
@@ -533,6 +535,29 @@ static MMDevice *MMDevice_Create(const WCHAR *name, GUID *id, EDataFlow flow, DW
 
             pv.pwszVal = guidstr;
             MMDevice_SetPropValue(id, flow, &deviceinterface_key, &pv);
+
+            {
+                /* PKEY_Audio_Device_InterfacePath: the MMDEVAPI device interface path
+                 * Windows publishes for every audio endpoint. */
+                static const PROPERTYKEY interfacepath_key = {
+                    {0x9c119480, 0xddc2, 0x4954, {0xa1, 0x50, 0x5b, 0xd2, 0x40, 0xd4, 0x54, 0xad}}, 1
+                };
+                static const GUID render_class =
+                    {0xe6327cad, 0xdcec, 0x4949, {0xae, 0x8a, 0x99, 0x1e, 0x97, 0x6a, 0x79, 0xd2}};
+                static const GUID capture_class =
+                    {0x2eef81be, 0x33fa, 0x4800, {0x96, 0x70, 0x1c, 0xd4, 0x74, 0x97, 0x2c, 0x3f}};
+                const GUID *cls = flow == eCapture ? &capture_class : &render_class;
+                WCHAR path[128];
+
+                swprintf(path, ARRAY_SIZE(path),
+                         L"\\\\?\\SWD#MMDEVAPI#{0.0.%u.00000000}.%ls#{%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
+                         flow, guidstr, cls->Data1, cls->Data2, cls->Data3,
+                         cls->Data4[0], cls->Data4[1], cls->Data4[2], cls->Data4[3],
+                         cls->Data4[4], cls->Data4[5], cls->Data4[6], cls->Data4[7]);
+                pv.vt = VT_LPWSTR;
+                pv.pwszVal = path;
+                MMDevice_SetPropValue(id, flow, &interfacepath_key, &pv);
+            }
 
             if (FAILED(set_driver_prop_value(id, flow, &PKEY_AudioEndpoint_FormFactor)))
             {
@@ -1777,12 +1802,64 @@ static ULONG WINAPI Connector_Release(IConnector *iface)
     return ref;
 }
 
+/* Property key through which the unix audio drivers report the device path of the
+ * hardware an endpoint belongs to, see e.g. winepulse's get_device_path(). */
+static const PROPERTYKEY endpoint_devicepath_key = {
+    {0xb3f8fa53, 0x0004, 0x438e, {0x90, 0x03, 0x51, 0xa4, 0x6e, 0x13, 0x9b, 0xfc}}, 2
+};
+
+/* Builds the id Windows reports from IConnector::GetDeviceIdConnectedTo: a
+ * "{N}."-prefixed path identifying the physical device the endpoint belongs to.
+ * Our drivers already report such a path; fall back to a synthetic one derived
+ * from the endpoint GUID when they do not, so the value stays stable and unique
+ * per device. The returned string is CoTaskMemAlloc()-allocated, as the caller
+ * is expected to release it with CoTaskMemFree(). */
+static HRESULT get_connected_device_id(const MMDevice *device, WCHAR **out)
+{
+    static const WCHAR fallback[] = L"{1}.WINE\\AUDIO\\";
+    PROPVARIANT pv;
+    WCHAR *str;
+    size_t len;
+
+    *out = NULL;
+    PropVariantInit(&pv);
+
+    if (SUCCEEDED(MMDevice_GetPropValue(&device->devguid, device->flow, &endpoint_devicepath_key, &pv)) &&
+        pv.vt == VT_LPWSTR && pv.pwszVal)
+    {
+        len = wcslen(pv.pwszVal) + 1;
+        if ((str = CoTaskMemAlloc(len * sizeof(WCHAR))))
+            memcpy(str, pv.pwszVal, len * sizeof(WCHAR));
+        PropVariantClear(&pv);
+        if (!str)
+            return E_OUTOFMEMORY;
+        *out = str;
+        return S_OK;
+    }
+    PropVariantClear(&pv);
+
+    len = ARRAY_SIZE(fallback) + 39;
+    if (!(str = CoTaskMemAlloc(len * sizeof(WCHAR))))
+        return E_OUTOFMEMORY;
+    swprintf(str, len, L"%ls{%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}", fallback,
+             device->devguid.Data1, device->devguid.Data2, device->devguid.Data3,
+             device->devguid.Data4[0], device->devguid.Data4[1], device->devguid.Data4[2],
+             device->devguid.Data4[3], device->devguid.Data4[4], device->devguid.Data4[5],
+             device->devguid.Data4[6], device->devguid.Data4[7]);
+    *out = str;
+    return S_OK;
+}
+
 static HRESULT WINAPI Connector_GetType(
     IConnector *This,
     ConnectorType *pType)
 {
-    FIXME("(%p) - partial stub\n", This);
-    *pType = Physical_Internal;
+    TRACE("(%p)->(%p)\n", This, pType);
+
+    if (!pType)
+        return E_POINTER;
+
+    *pType = Physical_External;
     return S_OK;
 }
 
@@ -1790,8 +1867,19 @@ static HRESULT WINAPI Connector_GetDataFlow(
     IConnector *This,
     DataFlow *pFlow)
 {
-    FIXME("(%p) - stub\n", This);
-    return E_NOTIMPL;
+    IConnectorImpl *impl = impl_from_IConnector(This);
+
+    TRACE("(%p)->(%p)\n", This, pFlow);
+
+    if (!pFlow)
+        return E_POINTER;
+    if (!impl->device)
+        return E_FAIL;
+
+    /* The endpoint module's connector is its input pin for a render endpoint and
+     * its output pin for a capture endpoint, matching Windows. */
+    *pFlow = impl->device->flow == eCapture ? Out : In;
+    return S_OK;
 }
 
 static HRESULT WINAPI Connector_ConnectTo(
@@ -1813,8 +1901,13 @@ static HRESULT WINAPI Connector_IsConnected(
     IConnector *This,
     BOOL *pbConnected)
 {
-    FIXME("(%p) - stub\n", This);
-    return E_NOTIMPL;
+    TRACE("(%p)->(%p)\n", This, pbConnected);
+
+    if (!pbConnected)
+        return E_POINTER;
+
+    *pbConnected = TRUE;
+    return S_OK;
 }
 
 static HRESULT WINAPI Connector_GetConnectedTo(
@@ -1829,16 +1922,46 @@ static HRESULT WINAPI Connector_GetConnectorIdConnectedTo(
     IConnector *This,
     LPWSTR *ppwstrConnectorId)
 {
-    FIXME("(%p) - stub\n", This);
-    return E_NOTIMPL;
+    IConnectorImpl *impl = impl_from_IConnector(This);
+    WCHAR *device_id, *str;
+    size_t len;
+    HRESULT hr;
+
+    TRACE("(%p)->(%p)\n", This, ppwstrConnectorId);
+
+    if (!ppwstrConnectorId)
+        return E_POINTER;
+    if (!impl->device)
+        return E_FAIL;
+
+    if (FAILED((hr = get_connected_device_id(impl->device, &device_id))))
+        return hr;
+
+    len = wcslen(device_id) + ARRAY_SIZE(L"/00000000");
+    if ((str = CoTaskMemAlloc(len * sizeof(WCHAR))))
+        swprintf(str, len, L"%ls/00000000", device_id);
+    CoTaskMemFree(device_id);
+    if (!str)
+        return E_OUTOFMEMORY;
+
+    *ppwstrConnectorId = str;
+    return S_OK;
 }
 
 static HRESULT WINAPI Connector_GetDeviceIdConnectedTo(
     IConnector *This,
     LPWSTR *ppwstrDeviceId)
 {
-    FIXME("(%p) - stub\n", This);
-    return E_NOTIMPL;
+    IConnectorImpl *impl = impl_from_IConnector(This);
+
+    TRACE("(%p)->(%p)\n", This, ppwstrDeviceId);
+
+    if (!ppwstrDeviceId)
+        return E_POINTER;
+    if (!impl->device)
+        return E_FAIL;
+
+    return get_connected_device_id(impl->device, ppwstrDeviceId);
 }
 
 static const IConnectorVtbl Connector_Vtbl =
@@ -1856,7 +1979,7 @@ static const IConnectorVtbl Connector_Vtbl =
     Connector_GetDeviceIdConnectedTo,
 };
 
-HRESULT Connector_Create(IConnector **ppv)
+HRESULT Connector_Create(IMMDevice *device, IConnector **ppv)
 {
     IConnectorImpl *This;
 
@@ -1866,6 +1989,7 @@ HRESULT Connector_Create(IConnector **ppv)
 
     This->IConnector_iface.lpVtbl = &Connector_Vtbl;
     This->ref = 1;
+    This->device = device ? impl_from_IMMDevice(device) : NULL;
 
     *ppv = &This->IConnector_iface;
 
@@ -1929,11 +2053,18 @@ static HRESULT WINAPI DT_GetConnector(IDeviceTopology *This,
                                       UINT nIndex,
                                       IConnector **ppConnector)
 {
-    FIXME("(%p)->(%u, %p) - partial stub\n", This, nIndex, ppConnector);
+    IDeviceTopologyImpl *impl = impl_from_IDeviceTopology(This);
+
+    TRACE("(%p)->(%u, %p)\n", This, nIndex, ppConnector);
+
+    if (!ppConnector)
+        return E_POINTER;
+    if (!impl->device)
+        return E_FAIL;
 
     if (nIndex == 0)
     {
-        return Connector_Create(ppConnector);
+        return Connector_Create(&impl->device->IMMDevice_iface, ppConnector);
     }
 
     return E_INVALIDARG;
@@ -1965,8 +2096,16 @@ static HRESULT WINAPI DT_GetPartById(IDeviceTopology *This,
 static HRESULT WINAPI DT_GetDeviceId(IDeviceTopology *This,
                                      LPWSTR *ppwstrDeviceId)
 {
-    FIXME("(%p)->(%p) - stub\n", This, ppwstrDeviceId);
-    return E_NOTIMPL;
+    IDeviceTopologyImpl *impl = impl_from_IDeviceTopology(This);
+
+    TRACE("(%p)->(%p)\n", This, ppwstrDeviceId);
+
+    if (!ppwstrDeviceId)
+        return E_POINTER;
+    if (!impl->device)
+        return E_FAIL;
+
+    return IMMDevice_GetId(&impl->device->IMMDevice_iface, ppwstrDeviceId);
 }
 
 static HRESULT WINAPI DT_GetSignalPath(IDeviceTopology *This,
@@ -2004,6 +2143,7 @@ static HRESULT DeviceTopology_Create(IMMDevice *device, IDeviceTopology **ppv)
 
     This->IDeviceTopology_iface.lpVtbl = &DeviceTopology_Vtbl;
     This->ref = 1;
+    This->device = device ? impl_from_IMMDevice(device) : NULL;
 
     *ppv = &This->IDeviceTopology_iface;
 
